@@ -1,0 +1,307 @@
+---
+title: "Final Project"
+author: "Group 2"
+date: "12/14/2020"
+output: pdf_document
+---
+
+```{r}
+setwd("/Users/wanluxu/Documents/uwaterloo/Master/STAT931")
+set.seed(1)
+# Install the packages
+library(dplyr)
+library(twang)
+library(mice)
+library(survey)
+library(Matching)
+
+# Read in our data file for twin pairs
+data1 <- read.csv("twin_pairs_X_3years_samesex.csv")
+data2 <- read.csv("twin_pairs_T_3years_samesex.csv")
+data3 <- read.csv("twin_pairs_Y_3years_samesex.csv")
+
+data3$new_m <- rowSums(data3[,2:3])
+```
+
+```{r}
+# -------------------------------------------------------------------------------------- #
+## Data Preperation and Model Selection
+
+## Data Cleaning
+# Combine our data set and Check the missing data
+table1 <- data.frame(data1, data2, data3)
+sum(is.na(table1))
+# colMeans(is.na(table1)) < 0.1 proportion of miss data greater than 10%
+
+# Remove the columns' with NA's with the percentage of NA more than 10%
+table2 <- table1[,names(table1)[colMeans(is.na(table1)) < 0.1]]
+
+# For the rest of the missing data, we fill in the NA's using mice library
+temp_data <- mice(table2,meth='cart',printFlag = FALSE)
+temp_complete <- complete(temp_data,1)
+
+parse_no <-  function(x){
+  ifelse(x==0, 0, 1)
+}
+temp_complete$A_for_fit <- sapply(temp_complete$new_m, parse_no)  
+# Now our current data set is temp_complete
+parse_no <-  function(x){
+  ifelse(x==0, 0, 1)
+}
+temp_complete$A_for_fit <- sapply(temp_complete$new_m, parse_no) 
+```
+
+
+```{r}
+## Model Selection
+# use the Stepwise regression by backward elimination method to eliminate non-significant factors.
+model_0 <- glm(A_for_fit~pldel+birattnd+brstate+stoccfipb+mager8+ormoth+mrace
+              +meduc6+dmar+mplbir+mpre5+adequacy+birmon+gestat10+csex+anemia
+              +cardiac+lung+diabetes+hydra+hemo+chyper+phyper+eclamp+incervix
+              +pre4000+preterm+renal+rh+othermr+crace+data_year+nprevistq
+              +infant_id_0+infant_id_1++brstate_reg+stoccfipb_reg+mplbir_reg,
+              family = "binomial",data =temp_complete)
+# We get bwd.model as our study model
+bwd.model <- step(model_0,direction = 'backward')
+summary(bwd.model)
+
+
+
+# -------------------------------------------------------------------------------------- #
+## Propensity Score Estimation with Generalized Boosted Model
+# GBM: fit the propensity score model using twang package:
+p_model <- ps(A_for_fit ~ pldel + brstate + stoccfipb + mager8 +
+                ormoth + meduc6 + dmar + mpre5 + gestat10 + csex + lung + 
+                hydra + phyper + eclamp + incervix + preterm + renal + othermr + 
+                crace + data_year + nprevistq,
+              data =temp_complete,n.trees = 15000, interaction.depth = 2, 
+              shrinkage = 0.01,perm.test.iters = 0,stop.method = "es.mean", 
+              estimand = 'ATE', verbose = F)
+
+# balance table in original data and after adjusting for the propensity score
+table.balance <- bal.table(p_model)
+
+# Optimal number of trees based on ASMD
+p_model$desc$es.mean.ATE$n.trees
+# Average standardized absolute distance (ASAM)
+mean(abs(table.balance$es.mean.ATE$std.eff.sz))
+# Look at each confounders individually
+plot(p_model,plots=3)
+
+# Check variable importance
+summary(p_model$gbm.obj,n.trees=p_model$desc$es.mean.ATE$n.trees,plot=TRUE)
+
+# Check for overlapping between our treatment groups
+boxplot(p_model$ps$es.mean.ATE~p_model$data$A_for_fit,
+        main='Boxplot of estimated propensity scores',
+        xlab='Treatment group', ylab='PS')
+
+
+## Based on the estimated propensity scores, employ IPW to estimate the causal effect 
+
+# Check if there are extreme weights
+temp_complete$w <- get.weights(p_model, stop.method = "es.mean")
+boxplot(temp_complete$w)
+
+# Adjust for extreme weights using the cut-off value 20
+for (i in 1:length(temp_complete$w)) {
+  if (temp_complete$w[i] > 20) {
+    temp_complete$w[i] = 20
+  }
+}
+
+
+## Estimate the causal risk difference
+# we find the three factors have the larges coefficient and we are interested in their causal effect to
+#  twins death
+#'hydra': 'risk factor Hvdramnios/Oliqohvdramnios'
+#'incervix': 'risk factor, Incompetent cervix'
+#'preterm': 'risk factor, Previos pre-term or small' 
+design_ps = svydesign(ids=~1, weights=~w, data=temp_complete)
+msm1 <- svyglm(A_for_fit~hydra,design=design_ps)
+summary(msm1)
+msm2 <- svyglm(A_for_fit~incervix,design=design_ps)
+summary(msm2)
+msm3 <- svyglm(A_for_fit~preterm,design=design_ps)
+summary(msm3)
+
+
+
+# -------------------------------------------------------------------------------------- #
+## Propensity Score Matching
+# get the estimated propensity score
+ps <- bwd.model$fitted.values
+death <- temp_complete$A_for_fit
+tmt1 <- temp_complete$hydra
+tmt2 <- temp_complete$incervix
+tmt3 <- temp_complete$preterm
+
+## Check overlapping for each treatment group
+# treatment group 1
+hist(ps[tmt1==1])
+hist(ps[tmt1==0])
+# treatment group 2
+hist(ps[tmt2==1])
+hist(ps[tmt2==0])
+# treatment group 3
+hist(ps[tmt3==1])
+hist(ps[tmt3==0])
+
+# Matching for hydra as treatment
+rr1 <- Match(Y=death, Tr=tmt1, X=ps, M=1, replace=TRUE, 
+             estimand="ATE",version = 'fast')
+summary(rr1)
+
+# Matching for incervix as treatment
+rr2 <- Match(Y=death, Tr=tmt2, X=ps, M=1, replace=TRUE, 
+             estimand="ATE",version = 'fast')
+summary(rr2)
+
+# Matching for preterm as treatment
+rr3 <- Match(Y=death, Tr=tmt3, X=ps, M=1, replace=TRUE, 
+             estimand="ATE",version = 'fast')
+summary(rr3)
+
+
+# -------------------------------------------------------------------------------------- #
+
+## Propensity Score Stratification
+# Stratify the dataset into 4 approximately equally sized groups
+breakvals <- fivenum(ps)
+# Stratum for hydra as treatment
+strata <- cut(ps, breaks = breakvals,labels = c('bot','2nd','3rd','top'),
+              include.lowest = TRUE)
+stratdf1 <- data.frame(death,tmt1,strata)
+out1 <- by(stratdf1, strata, 
+           function(temp_complete){
+             with(temp_complete, 
+                   t.test(death[tmt1==0], death[tmt1==1]))})
+out1
+s1_1 <- lm(death~tmt1,data=temp_complete[strata=="bot",])
+s1_2 <- lm(death~tmt1,data=temp_complete[strata=="2nd",])
+s1_3 <- lm(death~tmt1,data=temp_complete[strata=="3rd",])
+s1_4 <- lm(death~tmt1,data=temp_complete[strata=="top",])
+# Estimated average causal effect for hydra
+ACE1 <- mean(c(s1_1$coefficients[2], s1_2$coefficients[2],
+               s1_3$coefficients[2], s1_4$coefficients[2]))
+ACE1
+
+# Stratum for incervix as treatment
+stratdf2 <- data.frame(death,tmt2,strata)
+out2 <- by(stratdf2, strata, 
+           function(temp_complete){
+             with(temp_complete,
+                  t.test(death[tmt2==0], death[tmt2==1]))})
+out2
+s2_1 <- lm(death~tmt2,data=temp_complete[strata=="bot",])
+s2_2 <- lm(death~tmt2,data=temp_complete[strata=="2nd",])
+s2_3 <- lm(death~tmt2,data=temp_complete[strata=="3rd",])
+s2_4 <- lm(death~tmt2,data=temp_complete[strata=="top",])
+# Estimated average causal effect for incervix
+ACE2 <- mean(c(s2_1$coefficients[2], s2_2$coefficients[2],
+               s2_3$coefficients[2], s2_4$coefficients[2]))
+ACE2
+
+# Stratum for preterm as treatment
+stratdf3 <- data.frame(death,tmt3,strata)
+out3 <- by(stratdf3, strata, 
+           function(temp_complete){with(temp_complete,
+          t.test(death[tmt3==0],death[tmt3==1]))})
+out3
+s3_1 <- lm(death~tmt3,data=temp_complete[strata=="bot",])
+s3_2 <- lm(death~tmt3,data=temp_complete[strata=="2nd",])
+s3_3 <- lm(death~tmt3,data=temp_complete[strata=="3rd",])
+s3_4 <- lm(death~tmt3,data=temp_complete[strata=="top",])
+# Estimated average causal effect for preterm
+ACE3 <- mean(c(s3_1$coefficients[2], s3_2$coefficients[2],
+               s3_3$coefficients[2], s3_4$coefficients[2]))
+ACE3
+
+
+
+# -------------------------------------------------------------------------------------- #
+
+# DR Estimation for hydra as tmt
+# Fit a logistic model for the propensity score
+glm1 <- glm(formula = A_for_fit ~ pldel + brstate + stoccfipb + mager8
+            + ormoth + meduc6 + dmar + mpre5 + gestat10 + csex + lung 
+            + phyper + eclamp + incervix + preterm + renal + othermr 
+            + crace + data_year + nprevistq, family = "binomial", 
+            data = temp_complete)
+ps1 <- glm1$fitted.values 
+summary(glm1)
+
+# Fit regression model for the outcome using data from the treatment group only
+out11 <- glm(formula = A_for_fit ~ pldel + brstate + stoccfipb + mager8 
+            + ormoth + meduc6 + dmar + mpre5 + gestat10 + csex + lung 
+            + phyper + eclamp + incervix + preterm + renal + othermr 
+            + crace + data_year + nprevistq, family = "binomial", 
+            data = temp_complete, subset=(tmt1==1))
+m11 <- predict(out11, temp_complete) 
+summary(out11)
+
+# Fit regression model for the outcome using data from the control group only
+out10 <- glm(formula = A_for_fit ~ pldel + brstate + stoccfipb + mager8 
+            + ormoth + meduc6 + dmar + mpre5 + gestat10 + csex + lung 
+            + phyper + eclamp + incervix + preterm + renal + othermr 
+            + crace + data_year + nprevistq, family = "binomial", 
+            data = temp_complete, subset=(tmt1==0))
+m10 <- predict(out10, temp_complete) 
+summary(out10)
+
+# Plug in predicted values into the expression for DR
+# get Double-robust estimate
+DR.est1 <- mean((tmt1*death - (tmt1-ps1)*m11)/ps1)-mean(((1-tmt1)*death + (tmt1-ps1)*m10)/(1-ps1))
+DR.est1
+
+# DR Estimation for incervix as tmt, the same as before
+glm2 <- glm(formula = A_for_fit ~ pldel + brstate + stoccfipb + mager8 
+            + ormoth + meduc6 + dmar + mpre5 + gestat10 + csex + lung 
+            + hydra + phyper + eclamp + preterm + renal + othermr 
+            + crace + data_year + nprevistq, family = "binomial", 
+            data = temp_complete)
+ps2 <- glm2$fitted.values
+out21 <- glm(formula = A_for_fit ~ pldel + brstate + stoccfipb + mager8 
+            + ormoth + meduc6 + dmar + mpre5 + gestat10 + csex + lung 
+            + hydra + phyper + eclamp + preterm + renal + othermr 
+            + crace + data_year + nprevistq, family = "binomial", 
+            data = temp_complete, subset=(tmt2==1))
+m21 <- predict(out21, temp_complete) 
+summary(out21)
+out20 <- glm(formula = A_for_fit ~ pldel + brstate + stoccfipb + mager8 
+            + ormoth + meduc6 + dmar + mpre5 + gestat10 + csex + lung 
+            + hydra + phyper + eclamp + preterm + renal + othermr 
+            + crace + data_year + nprevistq, family = "binomial", 
+            data = temp_complete, subset=(tmt2==0))
+m20 <- predict(out20, temp_complete) 
+summary(out20)
+# get Double-robust estimate
+DR.est2 <- mean((tmt2*death - (tmt2-ps2)*m21)/ps2)-mean(((1-tmt2)*death + (tmt2-ps2)*m20)/(1-ps2))
+DR.est2
+
+# DR Estimation for preterm as tmt, the same as before
+glm3 <- glm(formula = A_for_fit ~ pldel + brstate + stoccfipb + mager8 
+            + ormoth + meduc6 + dmar + mpre5 + gestat10 + csex + lung 
+            + hydra + phyper + eclamp + incervix + renal + othermr 
+            + crace + data_year + nprevistq, family = "binomial", 
+            data = temp_complete)
+ps3 <- glm3$fitted.values
+out31 <- glm(formula = A_for_fit ~ pldel + brstate + stoccfipb + mager8 
+            + ormoth + meduc6 + dmar + mpre5 + gestat10 + csex + lung 
+            + hydra + phyper + eclamp + incervix + renal + othermr 
+            + crace + data_year + nprevistq, family = "binomial", 
+            data = temp_complete, subset=(tmt3==1))
+m31 <- predict(out31, temp_complete) 
+summary(out31)
+out30 <- glm(formula = A_for_fit ~ pldel + brstate + stoccfipb + mager8 
+            + ormoth + meduc6 + dmar + mpre5 + gestat10 + csex + lung 
+            + hydra + phyper + eclamp + incervix + renal + othermr 
+            + crace + data_year + nprevistq, family = "binomial", 
+            data = temp_complete, subset=(tmt3==0))
+m30 <- predict(out30, temp_complete) 
+summary(out30)
+# get Double-robust estimate
+DR.est3 <- mean((tmt3*death - (tmt3-ps3)*m31)/ps3)-mean(((1-tmt3)*death + (tmt3-ps3)*m30)/(1-ps3))
+DR.est3
+```
+
